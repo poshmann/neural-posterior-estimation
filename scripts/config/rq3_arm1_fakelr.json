@@ -1,0 +1,128 @@
+{
+    "name": "rq3_arm1_fakelr",
+    "phase": "train",
+    "gpu_ids": [
+        0,
+        1,
+        2,
+        3
+    ],
+    "path": {
+        "experiments_root": "$RQ3_RUNS/rq3_arm1_fakelr",
+        "log": "logs",
+        "tb_logger": "tb",
+        "results": "results",
+        "checkpoint": "checkpoint",
+        "resume_state": "auto"
+    },
+    "datasets": {
+        "train": {
+            "name": "Sentinel2PlanetScope",
+            "dataroot": "$RQ3_DATA",
+            "hr_dir": "hr_200",
+            "sr_dir": "rq3_fake_lr",
+            "index_csv": "$RQ3_SPLITS/train.csv",
+            "mode": "HR",
+            "datatype": "img",
+            "l_resolution": 60,
+            "r_resolution": 200,
+            "batch_size": 16,
+            "num_workers": 8,
+            "use_shuffle": true,
+            "data_len": -1
+        },
+        "val": {
+            "name": "Sentinel2PlanetScope",
+            "dataroot": "$RQ3_DATA",
+            "hr_dir": "hr_200",
+            "sr_dir": "rq3_fake_lr",
+            "index_csv": "$RQ3_SPLITS/val_monitor.csv",
+            "mode": "HR",
+            "datatype": "img",
+            "l_resolution": 60,
+            "r_resolution": 200,
+            "batch_size": 8,
+            "num_workers": 4,
+            "use_shuffle": false,
+            "data_len": -1
+        },
+        "test": {
+            "name": "Sentinel2PlanetScope",
+            "dataroot": "$RQ3_TEST",
+            "hr_dir": "hr_200",
+            "sr_dir": "$EVAL_INPUT_DIR",
+            "index_csv": "$RQ3_SPLITS/test.csv",
+            "mode": "HR",
+            "datatype": "img",
+            "l_resolution": 60,
+            "r_resolution": 200,
+            "batch_size": 8,
+            "num_workers": 4,
+            "use_shuffle": false,
+            "data_len": -1
+        }
+    },
+    "model": {
+        "which_model_G": "wave",
+        "finetune_norm": false,
+        "unet": {
+            "in_channel": 32,
+            "out_channel": 16,
+            "inner_channel": 128,
+            "norm_groups": 16,
+            "channel_multiplier": [
+                1,
+                2,
+                4,
+                4,
+                8,
+                8,
+                16
+            ],
+            "attn_res": [
+                16
+            ],
+            "res_blocks": 3,
+            "dropout": 0
+        },
+        "beta_schedule": {
+            "train": {
+                "schedule": "linear",
+                "n_timestep": 2000,
+                "linear_start": 1e-06,
+                "linear_end": 0.01
+            },
+            "val": {
+                "schedule": "linear",
+                "n_timestep": 2000,
+                "linear_start": 1e-06,
+                "linear_end": 0.01
+            }
+        },
+        "diffusion": {
+            "image_size": 192,
+            "channels": 4,
+            "conditional": true
+        }
+    },
+    "train": {
+        "n_iter": 100000,
+        "val_freq": 10000,
+        "save_checkpoint_freq": 5000,
+        "keep_checkpoints": 3,
+        "print_freq": 100,
+        "seed": 42,
+        "use_amp": true,
+        "val_clip": false,
+        "optimizer": {
+            "type": "adam",
+            "lr": 4e-05
+        }
+    },
+    "eval": {
+        "color_fix": false
+    },
+    "wandb": {
+        "project": "rq3"
+    }
+}
