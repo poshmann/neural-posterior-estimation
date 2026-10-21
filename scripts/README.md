@@ -30,6 +30,12 @@ Test: 128 tiles, input = real Sentinel-2 for every arm.
 | `train.slurm` | trains one arm (4 full A100s, 48 h limit, resumes by itself) |
 | `eval.slurm` | super-resolves the 128 test tiles with an arm's best checkpoint |
 | `make_configs.py` → `config/` | the three training configs, generated from one template |
+| `simulator.py`, `simulate.py`, `simulate.slurm`, `prefetch_weights.py` | NPE: prior, forward model, fingerprints (see below) |
+| `evaluate_new_metrics.py`, `run_cluster_metrics.py` | the paper's metric code, copied **unchanged** (the P ruler) |
+| `npe.py` | NPE ensemble: train / validate (SBC, coverage, contraction, ABC baseline) / apply |
+| `prepare_real.py`, `ppc.py` | RQ2: real fingerprints of the paper's 3,000 pairs; posterior predictive check |
+| `build_arm2.py` | RQ3 arm 2: PlanetScope degraded with θ from the real-S2 posterior |
+| `evaluate_rq3.py`, `evaluate_rq3.slurm` | RQ3: score all arms on the 128 test tiles (P-ruler fingerprint + absolute reflectance metrics) |
 | **Model code** (WaveCM teacher, from github.com/lucpaul/SR3_Wavelet_Superres4Sentinel2 @ 59e295d) | |
 | `sr.py`, `core/`, `data/`, `model/`, `requirements.txt`, `LICENSE` | the training code; what we changed and why is in `CHANGES.md` |
 
@@ -82,6 +88,52 @@ sbatch eval.slurm rq3_arm3_s2
 sbatch eval.slurm rq3_arm1_fakelr own      # optional: arm 1 on its own input type
 ```
 Output: `$RQ3_RUNS/<arm>/eval_<input>/<stem>.tif` (float32, H,W,C, reflectance) + `quick_psnr.csv`.
+
+## NPE simulations (RQ1/RQ2)
+
+`simulator.py` = prior + forward model + fingerprint; `simulate.py` = makes the records.
+θ = (σ_b blur [0,4] px, shift magnitude r [0,3.33] px + random direction φ, σ_n noise [0,0.02] reflectance), uniform priors; the NPE infers (σ_b, r, σ_n).
+Forward model: blur → shift → bicubic 60×60 (anti-aliased) → noise → bicubic back. **θ = 0 is exactly fake-LR.**
+Fingerprint: P ruler, using the paper's own `evaluate_new_metrics.py` + `run_cluster_metrics.py` (copied unchanged).
+Checked on the Mac: θ = 0 reproduces the fake-LR files (difference 0.0) and the paper's fake-LR PSNR/SSIM/CW-SSIM (to 1e-14).
+
+```bash
+bash setup_env.sh 2>&1 | tail -3              # adds piq, open_clip_torch, pyrtools, pandas
+python prefetch_weights.py                    # login node: downloads LPIPS / DISTS / CLIP weights once
+sbatch --array=0 simulate.slurm timing 5      # 100 records, prints s/record
+sbatch --array=0-3 simulate.slurm train 10    # 50,000 records -> $RQ3_RUNS/sims/train_shard*.csv
+sbatch --array=0-1 simulate.slurm val 4       # 2,000 held-out records
+sbatch --array=0-1 simulate.slurm baseline 1  # theta=0 fingerprint of every tile = scene context
+```
+
+### NPE (`npe.py`, CPU is enough)
+x = fingerprint + the tile's own θ = 0 ("fake-LR") fingerprint as scene context; θ = (σ_b, r, σ_n).
+Ensemble of K normalising flows (sbi NPE), rejection-ABC baseline, and on held-out simulations from
+other tiles: log p(θ_true|x), SBC ranks, coverage, contraction and RMSE.
+```bash
+python npe.py train --train "$RQ3_RUNS/sims/train_shard*.csv" --val "$RQ3_RUNS/sims/val_shard*.csv" \
+  --context "$RQ3_RUNS/sims/baseline_*.csv" --grid --ensemble 5 --out npe_runs/v1
+python npe.py apply --run npe_runs/v1 --fingerprints <real pairs csv> --context <their baseline csv> --out posterior.csv
+```
+Dev test on the Mac (structural metrics only, 3,200 + 750 sims): calibrated, and context raised noise
+contraction from 0.47 to 0.79; blur/shift weakly identified with 3 metrics (see `npe_dev/`).
+
+## After the simulations: the full pipeline in order
+
+| step | command (HAICORE, `source env.sh` + env active) | output |
+|---|---|---|
+| 0. real fingerprints of the RQ3 tiles | `sbatch --array=0-1 simulate.slurm real 1` | `$RQ3_RUNS/sims/real_*` |
+| 1. train NPE (7 metrics + context) | `python npe.py train --train "$RQ3_RUNS/sims/train_shard*.csv" --val "$RQ3_RUNS/sims/val_shard*.csv" --context "$RQ3_RUNS/sims/baseline_*.csv" --grid --ensemble 5 --out npe_runs/v1` | report, calibration.png, ensemble.pt |
+| 2. real pairs of the paper (RQ2) | `python prepare_real.py --results <results_3000> --out real/` | `real/sentinel.csv`, `real/fakelr.csv` |
+| 3. posteriors for real S2 | `python npe.py apply --run npe_runs/v1 --fingerprints real/sentinel.csv --out real/post_s2.csv --samples-out real/post_s2.npz` (same for fakelr = positive control) | per-tile posterior summaries + samples |
+| 4. model check | `python ppc.py --samples real/post_s2.npz --real real/sentinel.csv --out ppc/` | ppc_summary.txt, ppc.png |
+| 5. arm-2 data | `python build_arm2.py --samples real/post_s2.npz --source pool --real-table real/sentinel.csv [--radiometry pair]` | `$RQ3_DATA/rq3_s2like/` + recipes csv |
+| 6. train + evaluate arm 2 | `sbatch train.slurm rq3_arm2_s2like`, then `sbatch eval.slurm rq3_arm2_s2like` | as arms 1 and 3 |
+| 7. score all arms | `sbatch evaluate_rq3.slurm` | `$RQ3_RUNS/rq3_eval/` summary, paired diffs, metrics.png |
+
+`build_arm2.py --source matched` instead uses each tile's own real-S2 posterior
+(needs step 0 + `npe.py apply` on `$RQ3_RUNS/sims/real_*` with `--context "$RQ3_RUNS/sims/baseline_*"`).
+For step 2 copy `sentinel_per_tile.csv` and `fakelr_per_tile.csv` from `super-resolution-degradation/results_3000/` to HAICORE.
 
 ## HAICORE facts (checked 20 Oct 2026)
 - Partition `normal`: max 3 days per job, 1 node.

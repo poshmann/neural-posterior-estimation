@@ -76,8 +76,8 @@ TEMPLATE = {
     "train": {
         "n_iter": 100000,              # fixed budget, identical for all arms (~1,280 epochs of 5,000 tiles)
         "val_freq": 10000,
-        "save_checkpoint_freq": 5000,
-        "keep_checkpoints": 3,
+        "save_checkpoint_freq": 10000,   # one checkpoint set is ~15 GB
+        "keep_checkpoints": 1,          # newest only (enough to resume)
         "print_freq": 100,
         "seed": 42,                    # identical initial weights in every arm
         "use_amp": True,

@@ -1,0 +1,12 @@
+== NPE ensemble x2  (n = 150 held-out simulations)
+   mean log p(theta_true | x) = 1.724
+   param     SBC KS p  cov50  cov90  cov95  contract  RMSE post  RMSE prior
+   sigma_b      0.388   0.50   0.90   0.93      0.22     1.0432      1.1304
+   r            0.277   0.47   0.85   0.93      0.07     0.9797      1.0046
+   sigma_n      0.399   0.45   0.89   0.93      0.47     0.0046      0.0058
+
+== rejection ABC (k=64)  (n = 150 held-out simulations)
+   param     SBC KS p  cov50  cov90  cov95  contract  RMSE post  RMSE prior
+   sigma_b      0.658   0.53   0.91   0.93      0.15     1.0561      1.1304
+   r            0.286   0.46   0.87   0.92      0.05     0.9899      1.0046
+   sigma_n      0.227   0.43   0.86   0.91      0.51     0.0046      0.0058

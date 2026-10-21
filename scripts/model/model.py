@@ -228,6 +228,10 @@ class DDPM(BaseModel):
         for key, param in state_dict.items():
             state_dict[key] = param.cpu()
         torch.save(state_dict, gen_path)
+        if best_ckp:
+            # RQ3: the best checkpoint is only used for evaluation -> weights only (saves ~10 GB)
+            logger.info('Saved best model weights in [{:s}] ...'.format(gen_path))
+            return
         # opt
         opt_state = {'epoch': epoch, 'iter': iter_step, 'scheduler': None, 'optimizer': None}
         opt_state['scheduler'] = self.scheduler.state_dict()

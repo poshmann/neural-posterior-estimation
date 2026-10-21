@@ -14,6 +14,10 @@ PY="$RQ3_VENV/bin/python"
 "$PY" -m pip install --upgrade pip wheel
 # torch wheels for CUDA 12.8 come from the PyTorch index; the rest from PyPI
 "$PY" -m pip install -r "$RQ3_CODE/requirements.txt" --extra-index-url https://download.pytorch.org/whl/cu128
+# NPE: sbi (its dependency nflows only builds without build isolation); keep the cu128 torch
+"$PY" -m pip install --no-build-isolation nflows
+"$PY" -m pip install sbi "torch==2.9.1" --extra-index-url https://download.pytorch.org/whl/cu128
+"$PY" -m pip freeze > "$RQ3_CODE/requirements.lock.txt"     # exact versions, for the thesis
 "$PY" - <<'PYEOF'
 import torch, pytorch_wavelets, tifffile, cv2, skimage, lpips, clip
 print("torch", torch.__version__, "| CUDA build", torch.version.cuda)
