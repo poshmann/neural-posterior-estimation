@@ -46,7 +46,10 @@ INFER = ["sigma_b", "r", "sigma_n"]          # what the NPE estimates
 # Prior: independent uniforms.  low, high
 PRIOR = {
     "sigma_b": (0.0, 4.0),        # PlanetScope px; catalogue 0-3, S2 nearest defocus 3-4
-    "r":       (0.0, 10 / 3),     # up to 1 Sentinel-2 pixel
+    "r":       (0.0, 20 / 3),     # up to 2 Sentinel-2 pixels (20 m). Was 10/3 (1 S2 px) until 29 Oct 2026:
+                                  # 28.5% of real held-out S2 posteriors piled up at that edge. The old 50k
+                                  # simulations (r < 10/3) are kept and topped up with r in [10/3, 20/3]
+                                  # ("rext" runs) -> together uniform on the new range.
     "phi":     (0.0, 2 * np.pi),  # direction, nuisance
     "sigma_n": (0.0, 0.02),       # reflectance
 }

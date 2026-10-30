@@ -8,7 +8,8 @@ The paper already scored 3,000 real pairs (results_3000/, P ruler, native tile s
                                                              (checked: PSNR/SSIM/CW-SSIM equal to 1e-14)
 So the scene context b_<metric> of every real tile is simply its fake-LR row. No new computation.
 
-    python prepare_real.py --results ~/Desktop/super-resolution-degradation/results_3000 --out real/
+    python prepare_real.py --results ~/Desktop/super-resolution-degradation/results_3000 \
+        --hr-dir "$RQ3_DATA/hr_200" "$RQ3_TEST/hr_200" --out real/
 
 Writes
     real/sentinel.csv   tile, 7 metrics, b_<7 metrics>, group, region   (input for npe.py apply)
@@ -35,6 +36,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", required=True, help="folder with sentinel_per_tile.csv and fakelr_per_tile.csv")
     ap.add_argument("--splits", default=str(HERE / "splits"))
+    ap.add_argument("--hr-dir", nargs="*", default=[],
+                    help="folder(s) with the PlanetScope tiles: tile size H is read from them (needed by the NPE)")
+    ap.add_argument("--sizes", default=None, help="alternatively a csv with tile,H")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
@@ -50,8 +54,25 @@ def main():
         for r in csv.DictReader(open(Path(a.splits) / f"{sp}.csv")):
             split_of[r["stem"]] = sp
 
+    size = {}
+    if a.sizes:
+        z = pd.read_csv(a.sizes)
+        size = dict(zip(z["tile"].astype(str).str.replace(".tif", "", regex=False), z["H"]))
+    elif a.hr_dir:
+        import tifffile
+        for st in s2["stem"]:
+            for dd in a.hr_dir:
+                p = Path(dd) / f"{st}.tif"
+                if p.exists():
+                    with tifffile.TiffFile(p) as tf:
+                        size[st] = tf.pages[0].shape[0]
+                    break
     for name, d in (("sentinel", s2), ("fakelr", fk)):
         t = d[["stem"] + M].merge(ctx, on="stem", how="inner")
+        if size:
+            t["H"] = t["stem"].map(size)
+            if t["H"].isna().any():
+                raise SystemExit(f"tile size missing for {int(t['H'].isna().sum())} tiles")
         t["group"] = t["stem"].map(group)
         t["region"] = ["sim_train" if g in train_groups else "held_out" for g in t["group"]]
         t["rq3_split"] = t["stem"].map(split_of).fillna("-")

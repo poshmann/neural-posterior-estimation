@@ -73,9 +73,30 @@ def add_context(df, context_csv):
     return out.drop(columns=["_k"] + [c for c in out.columns if c.endswith("_ctx")])
 
 
-def features_present(df):
-    feats = [f for f in FEATURES if f in df.columns and df[f].notna().all()]
+def add_scene(df, scene_csv):
+    """Scene contrast: per-band std of the clean PlanetScope tile in reflectance (hr_std0..3), as log10.
+    The P ruler min-max normalises every image, so the fingerprint cannot tell how strong absolute
+    noise is relative to the scene; this context restores that information (known for real pairs too)."""
+    if not scene_csv:
+        return df
+    sc = pd.read_csv(scene_csv)
+    key = "stem" if "stem" in df.columns else "tile"
+    sc["_k"] = sc["stem"].astype(str).str.replace(".tif", "", regex=False)
+    cols = [c for c in sc.columns if c.startswith("hr_std")]
+    for c in cols:
+        sc[f"log_{c}"] = np.log10(sc[c].clip(lower=1e-6))
+    out = df.assign(_k=df[key].astype(str).str.replace(".tif", "", regex=False)) \
+            .merge(sc[["_k"] + [f"log_{c}" for c in cols]], on="_k", how="left").drop(columns=["_k"])
+    miss = out[[f"log_{c}" for c in cols]].isna().any(axis=1).sum()
+    if miss:
+        raise SystemExit(f"{miss} rows have no scene statistics in {scene_csv}")
+    return out
+
+
+def features_present(df, extra=()):
+    feats = [f for f in FEATURES if f in df.columns and df[f].notna().all()] + [e for e in extra if e in df.columns]
     feats += [f"b_{f}" for f in FEATURES if f"b_{f}" in df.columns and df[f"b_{f}"].notna().all()]
+    feats += sorted(c for c in df.columns if c.startswith("log_hr_std"))
     if len(feats) < 3:
         raise SystemExit(f"too few fingerprint columns: {feats}")
     return feats
@@ -86,6 +107,33 @@ def prior_box():
     lo = torch.tensor([S.PRIOR[k][0] for k in S.INFER], dtype=torch.float32)
     hi = torch.tensor([S.PRIOR[k][1] for k in S.INFER], dtype=torch.float32)
     return BoxUniform(lo, hi), lo.numpy(), hi.numpy()
+
+
+EPS = 1e-6
+
+
+class Logit:
+    """theta in [lo, hi]  <->  u = logit((theta - lo) / (hi - lo)) in R.
+    Training the flow on u removes the hard prior edges (no probability leaks past them)."""
+    def __init__(self, lo, hi):
+        self.lo, self.w = np.asarray(lo, np.float64), np.asarray(hi, np.float64) - np.asarray(lo, np.float64)
+
+    def fwd(self, th):
+        p = np.clip((np.asarray(th, np.float64) - self.lo) / self.w, EPS, 1 - EPS)
+        return np.log(p) - np.log1p(-p)
+
+    def inv(self, u):
+        return self.lo + self.w / (1 + np.exp(-np.asarray(u, np.float64)))
+
+    def log_jac(self, th):           # log |du/dtheta|
+        p = np.clip((np.asarray(th, np.float64) - self.lo) / self.w, EPS, 1 - EPS)
+        return (-np.log(self.w) - np.log(p) - np.log1p(-p)).sum(-1)
+
+    def prior(self):
+        """The uniform box prior, pushed into u space (logistic marginals)."""
+        from torch.distributions import Independent, TransformedDistribution, Uniform, SigmoidTransform
+        base = Independent(Uniform(torch.full((len(self.lo),), EPS), torch.full((len(self.lo),), 1 - EPS)), 1)
+        return TransformedDistribution(base, [SigmoidTransform().inv])
 
 
 # ----------------------------------------------------------------------------- training
@@ -104,20 +152,29 @@ def train_one(theta, x, prior, model, transforms, hidden, lr, batch, seed):
 
 
 class Ensemble:
-    """Equal-weight mixture of K posteriors (written out, independent of sbi version)."""
-    def __init__(self, posts):
-        self.posts = posts
+    """Equal-weight mixture of K posteriors (written out, independent of sbi version).
+    If `logit` is given the flows live in u space; samples and densities are mapped back to theta."""
+    def __init__(self, posts, logit=None):
+        self.posts, self.logit = posts, logit
 
     def sample(self, n, x):
         k = len(self.posts)
         counts = np.random.multinomial(n, [1 / k] * k)
         parts = [p.sample((int(c),), x=x, show_progress_bars=False) for p, c in zip(self.posts, counts) if c]
         out = torch.cat(parts)
-        return out[torch.randperm(len(out))]
+        out = out[torch.randperm(len(out))]
+        if self.logit is not None:
+            out = torch.as_tensor(self.logit.inv(out.numpy()), dtype=torch.float32)
+        return out
 
     def log_prob(self, theta, x):
-        lp = torch.stack([p.log_prob(theta, x=x) for p in self.posts])       # (K, n)
-        return torch.logsumexp(lp, 0) - np.log(len(self.posts))
+        th = torch.as_tensor(theta, dtype=torch.float32)
+        u = th if self.logit is None else torch.as_tensor(self.logit.fwd(th.numpy()), dtype=torch.float32)
+        lp = torch.stack([p.log_prob(u, x=x) for p in self.posts])       # (K, n)
+        lp = torch.logsumexp(lp, 0) - np.log(len(self.posts))
+        if self.logit is not None:
+            lp = lp + torch.as_tensor(self.logit.log_jac(th.numpy()), dtype=torch.float32)
+        return lp
 
 
 # ----------------------------------------------------------------------------- evaluation
@@ -197,16 +254,20 @@ def plots(results, out):
 # ----------------------------------------------------------------------------- commands
 def cmd_train(a):
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    tr, va = add_context(load(a.train), a.context), add_context(load(a.val), a.context)
+    tr = add_scene(add_context(load(a.train), a.context), a.scene)
+    va = add_scene(add_context(load(a.val), a.context), a.scene)
     shared = set(tr.stem) & set(va.stem)
     if shared:
         raise SystemExit(f"{len(shared)} tiles appear in both train and val simulations")
-    feats = features_present(tr)
+    feats = features_present(tr, extra=a.extra)
     mu, sd = tr[feats].mean().to_numpy(), tr[feats].std().to_numpy()
     xt = ((tr[feats].to_numpy() - mu) / sd).astype(np.float32)
     xv = ((va[feats].to_numpy() - mu) / sd).astype(np.float32)
     tt, tv = tr[S.INFER].to_numpy(np.float32), va[S.INFER].to_numpy(np.float32)
     prior, lo, hi = prior_box()
+    logit = Logit(lo, hi) if a.logit else None
+    train_prior = logit.prior() if logit else prior
+    tt_fit = logit.fwd(tt).astype(np.float32) if logit else tt
     print(f"train {len(tr)} sims / {tr.stem.nunique()} tiles | val {len(va)} / {va.stem.nunique()} tiles | "
           f"features {feats}")
 
@@ -216,24 +277,24 @@ def cmd_train(a):
     best = None
     for g in grid:
         t0 = time.time()
-        post = train_one(tt, xt, prior, lr=a.lr, batch=a.batch, seed=0, **g)
+        post = train_one(tt_fit, xt, train_prior, lr=a.lr, batch=a.batch, seed=0, **g)
+        one = Ensemble([post], logit)
         sel_pos = [va.index.get_loc(i) for i in sel]
-        lp = float(np.mean([float(post.log_prob(torch.as_tensor(tv[i:i + 1]), x=torch.as_tensor(xv[i])))
-                            for i in sel_pos]))
+        lp = float(np.mean([float(one.log_prob(tv[i:i + 1], torch.as_tensor(xv[i]))) for i in sel_pos]))
         print(f"  {g}  val log-prob {lp:.3f}  ({time.time() - t0:.0f} s)", flush=True)
         if best is None or lp > best[0]:
             best = (lp, g, post)
     g = best[1]
     print(f"selected {g}; training ensemble of {a.ensemble}", flush=True)
-    posts = [best[2]] + [train_one(tt, xt, prior, lr=a.lr, batch=a.batch, seed=s, **g)
+    posts = [best[2]] + [train_one(tt_fit, xt, train_prior, lr=a.lr, batch=a.batch, seed=s, **g)
                          for s in range(1, a.ensemble)]
-    ens = Ensemble(posts)
+    ens = Ensemble(posts, logit)
 
     def npe_sampler(xrow, n):
         return ens.sample(n, torch.as_tensor(xrow)).numpy()
 
     def npe_lp(th, xrow):
-        return ens.log_prob(torch.as_tensor(th[None]), torch.as_tensor(xrow)).item()
+        return ens.log_prob(th[None], torch.as_tensor(xrow)).item()
 
     k = max(20, int(a.abc_frac * len(tr)))
 
@@ -242,6 +303,7 @@ def cmd_train(a):
         return tt[np.random.choice(idx, n, replace=True)]
 
     ev = va.drop(index=sel) if len(va) > len(sel) + 50 else va           # evaluate on the rest
+    ev = ev.sample(frac=1, random_state=1)        # shuffle: val files are concatenated by prior range (old, rext)
     xe = ((ev[feats].to_numpy() - mu) / sd).astype(np.float32)
     te = ev[S.INFER].to_numpy(np.float32)
     n_eval = min(len(ev), a.n_eval)
@@ -250,8 +312,9 @@ def cmd_train(a):
     report(res, out / "report.txt")
     plots(res, out / "calibration.png")
     torch.save({"posteriors": posts, "features": feats, "mu": mu, "sd": sd, "infer": S.INFER,
+                "logit": (lo.tolist(), hi.tolist()) if logit else None,
                 "prior": {k_: S.PRIOR[k_] for k_ in S.INFER}, "hparams": g}, out / "ensemble.pt")
-    json.dump({"hparams": g, "features": feats, "ensemble": a.ensemble, "n_train": len(tr),
+    json.dump({"hparams": g, "features": feats, "ensemble": a.ensemble, "n_train": len(tr), "logit": bool(logit),
                "results": [{k_: v for k_, v in r.items() if k_ != "_ranks"} for r in res]},
               open(out / "summary.json", "w"), indent=2)
     print(f"saved -> {out}")
@@ -259,8 +322,8 @@ def cmd_train(a):
 
 def cmd_apply(a):
     run = torch.load(Path(a.run) / "ensemble.pt", weights_only=False)
-    ens = Ensemble(run["posteriors"])
-    df = add_context(pd.read_csv(a.fingerprints), a.context)
+    ens = Ensemble(run["posteriors"], Logit(*run["logit"]) if run.get("logit") else None)
+    df = add_scene(add_context(pd.read_csv(a.fingerprints), a.context), a.scene)
     x = ((df[run["features"]].to_numpy() - run["mu"]) / run["sd"]).astype(np.float32)
     rows, keep = [], []
     for i in range(len(df)):
@@ -272,6 +335,10 @@ def cmd_apply(a):
             q = np.quantile(s[:, k], [0.05, 0.5, 0.95])
             r.update({f"{name}_mean": s[:, k].mean(), f"{name}_sd": s[:, k].std(),
                       f"{name}_q05": q[0], f"{name}_q50": q[1], f"{name}_q95": q[2]})
+        C = np.corrcoef(s.T)        # posterior correlation: blur-noise confounding shows up as corr(sigma_b, sigma_n)
+        for j in range(len(run["infer"])):
+            for k in range(j + 1, len(run["infer"])):
+                r[f"corr_{run['infer'][j]}_{run['infer'][k]}"] = C[j, k]
         rows.append(r)
     pd.DataFrame(rows).to_csv(a.out, index=False)
     print(f"{len(rows)} posteriors -> {a.out}")
@@ -279,6 +346,46 @@ def cmd_apply(a):
         np.savez_compressed(a.samples_out, tiles=np.array([str(r["tile"]) for r in rows]),
                             samples=np.stack(keep), names=np.array(run["infer"]))
         print(f"posterior samples ({len(keep)} tiles x {a.keep}) -> {a.samples_out}")
+
+
+def cmd_eval(a):
+    """Re-evaluate a saved run on held-out sims (same selection as train, shuffled), NPE vs rejection ABC."""
+    run = torch.load(Path(a.run) / "ensemble.pt", weights_only=False)
+    logit = Logit(*run["logit"]) if run.get("logit") else None
+    ens = Ensemble(run["posteriors"], logit)
+    feats, mu, sd = run["features"], run["mu"], run["sd"]
+    tr = add_scene(add_context(load(a.train), a.context), a.scene)
+    va = add_scene(add_context(load(a.val), a.context), a.scene)
+    xt = ((tr[feats].to_numpy() - mu) / sd).astype(np.float32)
+    tt = tr[S.INFER].to_numpy(np.float32)
+    _, lo, hi = prior_box()
+    sel = va.sample(n=min(len(va), 300), random_state=0).index
+    ev = va.drop(index=sel) if len(va) > len(sel) + 50 else va
+    ev = ev.sample(frac=1, random_state=1)
+    xe = ((ev[feats].to_numpy() - mu) / sd).astype(np.float32)
+    te = ev[S.INFER].to_numpy(np.float32)
+    n = min(len(ev), a.n_eval)
+    k = max(20, int(a.abc_frac * len(tr)))
+
+    def npe_sampler(xrow, m):
+        return ens.sample(m, torch.as_tensor(xrow)).numpy()
+
+    def npe_lp(th, xrow):
+        return ens.log_prob(th[None], torch.as_tensor(xrow)).item()
+
+    def abc_sampler(xrow, m):
+        idx = np.argsort(((xt - xrow) ** 2).sum(1))[:k]
+        return tt[np.random.choice(idx, m, replace=True)]
+
+    res = [evaluate(npe_sampler, npe_lp, te[:n], xe[:n], lo, hi, label=f"NPE ensemble x{len(run['posteriors'])}"),
+           evaluate(abc_sampler, None, te[:n], xe[:n], lo, hi, label=f"rejection ABC (k={k})")]
+    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
+    report(res, out / "report.txt")
+    plots(res, out / "calibration.png")
+    json.dump({"run": str(a.run), "n_eval": n,
+               "results": [{k_: v for k_, v in r.items() if k_ != "_ranks"} for r in res]},
+              open(out / "summary.json", "w"), indent=2)
+    print(f"saved -> {out}")
 
 
 def main():
@@ -296,6 +403,10 @@ def main():
     t.add_argument("--ensemble", type=int, default=5)
     t.add_argument("--grid", action="store_true")
     t.add_argument("--abc-frac", type=float, default=0.02)
+    t.add_argument("--logit", action=argparse.BooleanOptionalAction, default=True,
+                   help="train the flow on logit-transformed theta (removes prior-edge leakage); --no-logit to switch off")
+    t.add_argument("--extra", nargs="*", default=["H"], help="extra input columns (default: tile size H)")
+    t.add_argument("--scene", default=None, help="csv stem,hr_std0..3: scene contrast of the PlanetScope tile")
     t.add_argument("--n-eval", type=int, default=400)
     t.add_argument("--context", default=None, help="CSV(s, glob ok) with stem + b_<metric>: theta=0 fingerprint per tile")
     p = sub.add_parser("apply")
@@ -304,10 +415,20 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--n-samples", type=int, default=2000)
     p.add_argument("--context", default=None)
+    p.add_argument("--scene", default=None)
     p.add_argument("--samples-out", default=None, help=".npz with posterior samples per tile (for build_arm2.py)")
     p.add_argument("--keep", type=int, default=200, help="samples per tile kept in --samples-out")
+    e = sub.add_parser("eval", help="re-evaluate a saved run on held-out sims")
+    e.add_argument("--run", required=True)
+    e.add_argument("--train", nargs="+", required=True, help="train sims (for the ABC baseline)")
+    e.add_argument("--val", nargs="+", required=True)
+    e.add_argument("--out", required=True)
+    e.add_argument("--context", default=None)
+    e.add_argument("--scene", default=None)
+    e.add_argument("--n-eval", type=int, default=600)
+    e.add_argument("--abc-frac", type=float, default=0.02)
     a = ap.parse_args()
-    {"train": cmd_train, "apply": cmd_apply}[a.cmd](a)
+    {"train": cmd_train, "apply": cmd_apply, "eval": cmd_eval}[a.cmd](a)
 
 
 if __name__ == "__main__":

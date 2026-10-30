@@ -37,6 +37,10 @@ def main():
                     help="one theta=0 (fake-LR) record per tile, columns b_<metric>: scene context for the NPE")
     ap.add_argument("--real", action="store_true",
                     help="fingerprint the REAL Sentinel-2 pair (sr_60_200 vs hr_200) of each tile, no theta")
+    ap.add_argument("--r-min", type=float, default=None,
+                    help="draw r from U(r_min, prior max) instead of the full prior (top-up of a widened prior)")
+    ap.add_argument("--draw-offset", type=int, default=0,
+                    help="number draws from this offset: new seeds, no clash with earlier records of the same tile")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -67,7 +71,8 @@ def main():
 
     if a.baseline or a.real:
         a.draws = 1
-    todo = [(s, d) for s in stems for d in range(a.draws) if (s, d) not in done]
+    draws = range(a.draw_offset, a.draw_offset + a.draws)
+    todo = [(s, d) for s in stems for d in draws if (s, d) not in done]
     print(f"{a.split}: {len(stems)} tiles x {a.draws} draws -> {len(todo)} records to do "
           f"({len(done)} already in {out})", flush=True)
     t_start = time.time()
@@ -80,6 +85,10 @@ def main():
         seed = S.tile_seed(stem, d)
         rng = np.random.default_rng(seed)
         theta = np.zeros(len(S.THETA_NAMES)) if a.baseline else S.sample_prior(rng)[0]
+        if a.r_min is not None and not a.baseline:
+            k = S.THETA_NAMES.index("r")
+            r_max = S.PRIOR["r"][1]
+            theta[k] = a.r_min + (r_max - a.r_min) * (theta[k] - S.PRIOR["r"][0]) / (r_max - S.PRIOR["r"][0])
         if a.real:
             theta = np.full(len(S.THETA_NAMES), np.nan)
             deg = fp.A.load_tile(data.parent / "sr_60_200" / f"{stem}.tif")     # real Sentinel-2

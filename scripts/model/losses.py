@@ -41,10 +41,8 @@ class WeightedWaveletLoss(nn.Module):
         loss = loss_ll + loss_lh + loss_hl + loss_hh
         weights = self.ll_weight + self.lh_weight + self.hl_weight + self.hh_weight
       
-        if not torch.isfinite(loss):
-            print("Skipping step due to invalid loss.")
-            loss = torch.zeros((), device=loss.device, requires_grad=True)
-        else:
-            loss = loss / weights
+        # RQ3 (30 Oct 2026): return the invalid loss as it is; model.optimize_parameters skips the step
+        # on all ranks (upstream returned a detached zero, which crashed GradScaler.step)
+        loss = loss / weights
 
         return loss

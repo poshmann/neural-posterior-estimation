@@ -24,9 +24,15 @@ class DDPM(BaseModel):
         use_amp_cfg = opt['train']['use_amp'] if opt['train'] and opt['train']['use_amp'] is not None else True
         self.use_amp = bool(use_amp_cfg) and torch.cuda.is_available()
         self.amp_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # RQ3 (30 Oct 2026): train.amp_dtype "bf16" (300k runs) or "fp16" (default = upstream, 100k runs).
+        # fp16 overflowed (inf activations) after single updates at lr 1e-4 and crashed all 300k runs;
+        # bf16 has the float32 range, so no overflow and no loss scaling needed (GradScaler off).
+        amp_dtype_cfg = (opt['train']['amp_dtype'] if opt['train'] and opt['train']['amp_dtype'] else 'fp16')
+        self.amp_dtype = torch.bfloat16 if str(amp_dtype_cfg).lower() in ('bf16', 'bfloat16') else torch.float16
+        self.n_skipped, self.n_skipped_row = 0, 0
         self.scaler = torch.amp.GradScaler(
             "cuda", 
-            enabled=self.use_amp,
+            enabled=self.use_amp and self.amp_dtype == torch.float16,
             init_scale=512.0,      # 2^9, quite conservative (default is 2^16=65536)
             growth_interval=5000,   # Wait longer before increasing scale
             backoff_factor=0.5,     # Halve scale on overflow
@@ -53,8 +59,22 @@ class DDPM(BaseModel):
 
             self.optG = torch.optim.Adam(optim_params, lr=opt['train']["optimizer"]["lr"])
             # RQ3: cosine decays over OUR budget (train.n_iter); upstream hard-coded T_max=750000
-            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optG, T_max=int(opt['train']['n_iter']), eta_min=1e-7)
+            warm = int(opt['train']['warmup_iters'] or 0)
+            if warm > 0:
+                # RQ3 (30 Oct 2026): linear warm-up over `warmup_iters`, then the same cosine to 1e-7
+                # over the remaining iterations (one LambdaLR, so checkpoint/resume works as before)
+                import math
+                n_tot, base, eta_min = int(opt['train']['n_iter']), float(opt['train']['optimizer']['lr']), 1e-7
+
+                def _lr_factor(step, warm=warm, n_tot=n_tot, base=base, eta_min=eta_min):
+                    if step < warm:
+                        return (step + 1) / warm
+                    t = min(1.0, (step - warm) / max(1, n_tot - warm))
+                    return eta_min / base + (1 - eta_min / base) * 0.5 * (1 + math.cos(math.pi * t))
+                self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optG, _lr_factor)
+            else:
+                self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    self.optG, T_max=int(opt['train']['n_iter']), eta_min=1e-7)
             self.log_dict = OrderedDict()
         self.load_network()
         # self.print_network()
@@ -74,20 +94,22 @@ class DDPM(BaseModel):
     def optimize_parameters(self):
         self.optG.zero_grad()
         
-        with torch.autocast(device_type=self.amp_device, dtype=torch.float16, enabled=self.use_amp):
+        with torch.autocast(device_type=self.amp_device, dtype=self.amp_dtype, enabled=self.use_amp):
             l_pix = self.netG(self.data)
             # need to average in multi-gpu
             # may need to change order to reflect channel last, but will see.
             b, c, h, w = self.data['HR'].shape
             l_pix = l_pix.sum()/int(b*c*h*w)
 
-            # Check for NaN loss
-        if torch.isnan(l_pix) or torch.isinf(l_pix):
-            print(f"WARNING: Invalid loss detected: {l_pix.item()}, skipping step")
-            self.log_dict['l_pix'] = 0.0
-            self.log_dict['grad_norm'] = 0.0
+        # RQ3 (30 Oct 2026): skip invalid batches on ALL ranks together, BEFORE backward. Upstream
+        # replaced the loss by a detached zero -> no gradients -> GradScaler.step asserted and crashed.
+        bad = torch.tensor(float(not torch.isfinite(l_pix.detach())), device=l_pix.device)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+        if bad.item() > 0:
+            self._skip(f"invalid loss {l_pix.item()}")
             return
-        
+
         self.scaler.scale(l_pix).backward()
 
         self.scaler.unscale_(self.optG)
@@ -96,14 +118,14 @@ class DDPM(BaseModel):
          # Log gradient norm
         self.log_dict['grad_norm'] = grad_norm.item()
 
-        # Skip update if gradients are too large (even after clipping)
-        if grad_norm > 100.0:
-            print(f"WARNING: Very large gradient norm: {grad_norm:.2f}, skipping step")
+        # Skip update if gradients are too large (even after clipping) or not finite (bf16 has no
+        # GradScaler to catch inf/NaN gradients). grad_norm is identical on all ranks after DDP sync.
+        if not torch.isfinite(grad_norm) or grad_norm > 100.0:
             self.scaler.update()
-            self.optG.zero_grad()
+            self._skip(f"gradient norm {grad_norm.item():.3g}")
             self.log_dict['l_pix'] = l_pix.item()
-            self.log_dict['grad_norm'] = grad_norm.item()
             return
+        self.n_skipped_row = 0
         
         scale_before = self.scaler.get_scale()
         self.scaler.step(self.optG)
@@ -121,14 +143,26 @@ class DDPM(BaseModel):
             else:
                 print(f"✓ Scale increased: {scale_before} → {scale_after}")
 
+    def _skip(self, why):
+        self.optG.zero_grad()
+        self.n_skipped += 1
+        self.n_skipped_row += 1
+        self.log_dict['l_pix'] = 0.0
+        self.log_dict['grad_norm'] = 0.0
+        self.log_dict['n_skipped'] = self.n_skipped
+        print(f"WARNING: skipping step ({why}); skipped {self.n_skipped} in total, {self.n_skipped_row} in a row",
+              flush=True)
+        if self.n_skipped_row > 50:
+            raise RuntimeError("more than 50 consecutive invalid steps: training has diverged, stopping")
+
     def test(self, continous=False):
         self.netG.eval()
         with torch.no_grad():
             if isinstance(self.netG, (nn.DataParallel, nn.parallel.DistributedDataParallel)):
-                with torch.autocast(device_type=self.amp_device, dtype=torch.float16, enabled=self.use_amp):
+                with torch.autocast(device_type=self.amp_device, dtype=self.amp_dtype, enabled=self.use_amp):
                     self.SR = self.netG.module.super_resolution(self.data['SR'], continous)
             else:
-                with torch.autocast(device_type=self.amp_device, dtype=torch.float16, enabled=self.use_amp):
+                with torch.autocast(device_type=self.amp_device, dtype=self.amp_dtype, enabled=self.use_amp):
                     self.SR = self.netG.super_resolution(self.data['SR'], continous)
             
             # Need to convert back to contiguous if using channels last

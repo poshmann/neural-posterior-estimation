@@ -33,7 +33,9 @@ Test: 128 tiles, input = real Sentinel-2 for every arm.
 | `simulator.py`, `simulate.py`, `simulate.slurm`, `prefetch_weights.py` | NPE: prior, forward model, fingerprints (see below) |
 | `evaluate_new_metrics.py`, `run_cluster_metrics.py` | the paper's metric code, copied **unchanged** (the P ruler) |
 | `npe.py` | NPE ensemble: train / validate (SBC, coverage, contraction, ABC baseline) / apply |
+| `scene_stats.py` | per-tile contrast of the PlanetScope tile (NPE context) |
 | `prepare_real.py`, `ppc.py` | RQ2: real fingerprints of the paper's 3,000 pairs; posterior predictive check |
+| `rq2_analysis.py` | RQ2: summarises the real-S2 posteriors vs the fake-LR control (group-bootstrap CIs, posterior correlations, figure) |
 | `build_arm2.py` | RQ3 arm 2: PlanetScope degraded with θ from the real-S2 posterior |
 | `evaluate_rq3.py`, `evaluate_rq3.slurm` | RQ3: score all arms on the 128 test tiles (P-ruler fingerprint + absolute reflectance metrics) |
 | **Model code** (WaveCM teacher, from github.com/lucpaul/SR3_Wavelet_Superres4Sentinel2 @ 59e295d) | |
@@ -78,6 +80,16 @@ sbatch train.slurm rq3_arm3_s2
 squeue -u $USER
 grep "Validation # PSNR" $RQ3_RUNS/rq3_arm1_fakelr/logs/train.log
 ```
+**29 Oct 2026: rerun at 300k iterations** (arm 3 was still improving at 100k). Same configs plus `_300k`
+(own run folders; the 100k runs stay as they are; ~37 h per arm, `train.slurm` limit 60 h):
+```bash
+sbatch train.slurm rq3_arm1_fakelr_300k
+sbatch train.slurm rq3_arm3_s2_300k
+sbatch eval.slurm rq3_arm1_fakelr_300k        # after training; same for arm 3
+sbatch evaluate_rq3.slurm _300k               # -> $RQ3_RUNS/rq3_eval_300k/
+# seed 2 (same as _300k, seed 43): train.slurm rq3_arm{1_fakelr,3_s2,2_s2like}_300k_seed2, eval likewise,
+# sbatch evaluate_rq3.slurm _300k_seed2       # -> $RQ3_RUNS/rq3_eval_300k_seed2/
+```
 If a job ever stops early, submit it again; it resumes from the newest checkpoint.
 The best checkpoint (validation PSNR) is `$RQ3_RUNS/<arm>/checkpoint/<arm>_best_gen.pth`.
 
@@ -104,6 +116,10 @@ sbatch --array=0 simulate.slurm timing 5      # 100 records, prints s/record
 sbatch --array=0-3 simulate.slurm train 10    # 50,000 records -> $RQ3_RUNS/sims/train_shard*.csv
 sbatch --array=0-1 simulate.slurm val 4       # 2,000 held-out records
 sbatch --array=0-1 simulate.slurm baseline 1  # theta=0 fingerprint of every tile = scene context
+# 29 Oct 2026: shift prior widened to 2 S2 px (r up to 20/3 PS px). Top-up with r in [10/3, 20/3];
+# old + rext records together are uniform on the new prior -> train the NPE on train_*shard*.csv:
+sbatch --array=0-3 simulate.slurm train 10 rext   # 50,000 records -> train_rext_shard*.csv
+sbatch --array=0-1 simulate.slurm val 4 rext      # 2,000 records  -> val_rext_shard*.csv
 ```
 
 ### NPE (`npe.py`, CPU is enough)
@@ -123,7 +139,8 @@ contraction from 0.47 to 0.79; blur/shift weakly identified with 3 metrics (see 
 | step | command (HAICORE, `source env.sh` + env active) | output |
 |---|---|---|
 | 0. real fingerprints of the RQ3 tiles | `sbatch --array=0-1 simulate.slurm real 1` | `$RQ3_RUNS/sims/real_*` |
-| 1. train NPE (7 metrics + context) | `python npe.py train --train "$RQ3_RUNS/sims/train_shard*.csv" --val "$RQ3_RUNS/sims/val_shard*.csv" --context "$RQ3_RUNS/sims/baseline_*.csv" --grid --ensemble 5 --out npe_runs/v1` | report, calibration.png, ensemble.pt |
+| 0b. scene contrast of every tile | `python scene_stats.py --real real_paper/sentinel_per_tile.csv --out scene_stats.csv` | `scene_stats.csv` |
+| 1. train NPE (7 metrics + context) | `python npe.py train --train "$RQ3_RUNS/sims/train_shard*.csv" --val "$RQ3_RUNS/sims/val_shard*.csv" --context "$RQ3_RUNS/sims/baseline_*.csv" --scene scene_stats.csv --grid --ensemble 5 --out npe_runs/v1` (θ trained in logit space, tile size H as input; both default) | report, calibration.png, ensemble.pt |
 | 2. real pairs of the paper (RQ2) | `python prepare_real.py --results <results_3000> --out real/` | `real/sentinel.csv`, `real/fakelr.csv` |
 | 3. posteriors for real S2 | `python npe.py apply --run npe_runs/v1 --fingerprints real/sentinel.csv --out real/post_s2.csv --samples-out real/post_s2.npz` (same for fakelr = positive control) | per-tile posterior summaries + samples |
 | 4. model check | `python ppc.py --samples real/post_s2.npz --real real/sentinel.csv --out ppc/` | ppc_summary.txt, ppc.png |

@@ -1,2 +1,15 @@
+# data and large results stay local / on HAICORE (see README, "Data and results")
 /Training Data/
+/npe_full/
+/results_haicore/
+/npe_dev/rq2_v3/
+/npe_dev/*.csv
+!/npe_dev/structural_*.csv
+*.tar.gz
+*.pt
+*.pth
+*.npz
+# system / python
 .DS_Store
+__pycache__/
+*.pyc

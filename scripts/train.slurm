@@ -1,7 +1,7 @@
 #!/bin/bash
 # Train one RQ3 arm on one node with 4 GPUs. Resumes automatically from the newest checkpoint,
 # so the same script can simply be submitted again if a job ever stops early.
-#   sbatch train.slurm rq3_arm1_fakelr        (or rq3_arm3_s2)
+#   sbatch train.slurm rq3_arm1_fakelr        (or rq3_arm3_s2; add _300k for the 300k-iteration runs)
 #
 # HAICORE@KIT: partition 'normal', max 3 days, 1 node. GPU type: see --gres line.
 #SBATCH --job-name=rq3_train
@@ -10,7 +10,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:full:4      # full A100-40GB; plain gpu:4 can give MIG slices
 #SBATCH --cpus-per-task=32
-#SBATCH --time=48:00:00
+#SBATCH --time=60:00:00      # 300k iterations ~37 h; queue max is 72 h
 #SBATCH --output=logs/%x_%j.out
 
 set -euo pipefail
